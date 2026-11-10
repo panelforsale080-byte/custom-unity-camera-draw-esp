@@ -6,6 +6,10 @@
 #include <elf.h>
 #include <vector>
 
+#ifndef DT_GNU_HASH
+#define DT_GNU_HASH 0x6ffffef5
+#endif
+
 namespace {
 
 struct SymTables {
@@ -178,12 +182,131 @@ bool elf_remote_bias(pid_t pid, uintptr_t map_base, ElfRemote &out) {
     return calc_bias_from_phdr(pid, map_base, eh, out.load_bias);
 }
 
+static uintptr_t relocate_dyn(uintptr_t raw, uintptr_t bias, uintptr_t base) {
+    if (!raw) return 0;
+    if (raw >= base && raw < base + 0x20000000ULL) return raw;
+    if (raw < 0x20000000ULL) return bias + raw;
+    return raw;
+}
+
+static bool dynsym_lookup(pid_t pid, uintptr_t base, const Elf64_Ehdr &eh, uintptr_t bias,
+                          const char *sym, uintptr_t &addr) {
+    if (!eh.e_phoff || eh.e_phnum == 0 || eh.e_phnum > 128) return false;
+    std::vector<Elf64_Phdr> ph(eh.e_phnum);
+    if (!mem_read(pid, base + eh.e_phoff, ph.data(), ph.size() * sizeof(Elf64_Phdr))) return false;
+
+    uintptr_t dynAddr = 0;
+    size_t dynBytes = 0;
+    for (const auto &p : ph) {
+        if (p.p_type != PT_DYNAMIC || !p.p_filesz) continue;
+        dynAddr = bias + (uintptr_t)p.p_vaddr;
+        dynBytes = (size_t)p.p_filesz;
+        break;
+    }
+    if (!dynAddr || dynBytes < sizeof(Elf64_Dyn)) return false;
+    if (dynBytes > 64 * 1024) dynBytes = 64 * 1024;
+
+    std::vector<Elf64_Dyn> dyn(dynBytes / sizeof(Elf64_Dyn));
+    if (!mem_read(pid, dynAddr, dyn.data(), dyn.size() * sizeof(Elf64_Dyn))) return false;
+
+    uintptr_t symtab = 0, strtab = 0, hash = 0, gnu = 0;
+    size_t strsz = 0;
+    for (const auto &d : dyn) {
+        if (d.d_tag == DT_NULL) break;
+        if (d.d_tag == DT_SYMTAB) symtab = (uintptr_t)d.d_un.d_ptr;
+        else if (d.d_tag == DT_STRTAB) strtab = (uintptr_t)d.d_un.d_ptr;
+        else if (d.d_tag == DT_STRSZ) strsz = (size_t)d.d_un.d_val;
+        else if (d.d_tag == DT_HASH) hash = (uintptr_t)d.d_un.d_ptr;
+        else if (d.d_tag == DT_GNU_HASH) gnu = (uintptr_t)d.d_un.d_ptr;
+    }
+    symtab = relocate_dyn(symtab, bias, base);
+    strtab = relocate_dyn(strtab, bias, base);
+    hash = relocate_dyn(hash, bias, base);
+    gnu = relocate_dyn(gnu, bias, base);
+    if (!symtab || !strtab || strsz == 0 || strsz > 8 * 1024 * 1024) return false;
+
+    size_t nsyms = 0;
+    if (hash) {
+        uint32_t hdr[2] = {};
+        if (mem_read(pid, hash, hdr, sizeof(hdr)) && hdr[1] > 0 && hdr[1] < 400000)
+            nsyms = hdr[1];
+    }
+    if (!nsyms && gnu) {
+        uint32_t hdr[4] = {};
+        if (!mem_read(pid, gnu, hdr, sizeof(hdr))) return false;
+        const uint32_t nbuckets = hdr[0];
+        const uint32_t symoff = hdr[1];
+        const uint32_t bloom = hdr[2];
+        if (!nbuckets || nbuckets > 1000000 || bloom > 1000000) return false;
+        const uintptr_t bucketsAddr = gnu + 16 + (uintptr_t)bloom * sizeof(uint64_t);
+        std::vector<uint32_t> buckets(nbuckets);
+        if (!mem_read(pid, bucketsAddr, buckets.data(), buckets.size() * sizeof(uint32_t)))
+            return false;
+        uint32_t hi = symoff;
+        for (uint32_t b : buckets)
+            if (b >= symoff && b > hi) hi = b;
+        size_t chainCount = (size_t)(hi - symoff) + 1;
+        std::vector<uint32_t> chains(chainCount);
+        const uintptr_t chainsAddr = bucketsAddr + nbuckets * sizeof(uint32_t);
+        if (!mem_read(pid, chainsAddr, chains.data(), chains.size() * sizeof(uint32_t)))
+            return false;
+        bool grew = true;
+        while (grew && chains.size() < 400000) {
+            grew = false;
+            for (uint32_t b : buckets) {
+                if (b < symoff) continue;
+                uint32_t i = b;
+                for (int step = 0; step < 100000; ++step) {
+                    const size_t ci = (size_t)(i - symoff);
+                    if (ci >= chains.size()) {
+                        const size_t extra = 8192;
+                        const size_t old = chains.size();
+                        chains.resize(old + extra);
+                        if (!mem_read(pid, chainsAddr + old * sizeof(uint32_t), chains.data() + old,
+                                      extra * sizeof(uint32_t)))
+                            return false;
+                        grew = true;
+                    }
+                    if (i > hi) hi = i;
+                    if (chains[ci] & 1u) break;
+                    ++i;
+                }
+            }
+        }
+        nsyms = (size_t)hi + 1;
+    }
+    if (!nsyms || nsyms > 400000) return false;
+
+    std::vector<char> str(strsz);
+    if (!mem_read(pid, strtab, str.data(), str.size())) return false;
+    str.back() = '\0';
+
+    constexpr size_t kChunk = 512;
+    for (size_t baseIdx = 0; baseIdx < nsyms; baseIdx += kChunk) {
+        const size_t n = std::min(kChunk, nsyms - baseIdx);
+        std::vector<Elf64_Sym> syms(n);
+        if (!mem_read(pid, symtab + baseIdx * sizeof(Elf64_Sym), syms.data(), n * sizeof(Elf64_Sym)))
+            return false;
+        for (const auto &s : syms) {
+            if (!s.st_value || s.st_name >= str.size()) continue;
+            const char *nm = str.data() + s.st_name;
+            const size_t avail = str.size() - s.st_name;
+            if (std::strnlen(nm, avail) == avail) continue;
+            if (std::strcmp(nm, sym) != 0) continue;
+            addr = bias + (uintptr_t)s.st_value;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool elf_remote_sym(pid_t pid, uintptr_t map_base, const char *name, uintptr_t &addr_out) {
     addr_out = 0;
     Elf64_Ehdr eh{};
     if (!read_ehdr(pid, map_base, eh)) return false;
     uintptr_t bias = 0;
     if (!calc_bias_from_phdr(pid, map_base, eh, bias)) return false;
+    if (dynsym_lookup(pid, map_base, eh, bias, name, addr_out)) return true;
     return sym_from_sections_remote(pid, map_base, eh, bias, name, addr_out);
 }
 

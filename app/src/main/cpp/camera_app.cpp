@@ -275,7 +275,10 @@ bool resolve_locked(pid_t pid) {
     g_rtInvoke = g_getMain = g_w2c = g_proj = g_w2s = 0;
     g_bm = g_playerOff = g_localOff = g_posOff = g_campOff = 0;
     if (!remote_detect_il2cpp(pid, g_il2)) {
-        set_status("IL2CPP was not found in this process");
+        if (g_il2.note[0])
+            set_status(g_il2.note);
+        else
+            set_status("IL2CPP was not found in this process");
         return false;
     }
     if (!g_il2.domain_ptr) remote_il2cpp_prime_domain(pid, g_il2);

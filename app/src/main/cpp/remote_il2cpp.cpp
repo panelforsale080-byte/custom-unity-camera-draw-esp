@@ -29,6 +29,28 @@ static bool skip_lib(const std::string &path) {
     return name == "libdobby.so" || name == "libTool.so";
 }
 
+static int lib_score(const std::string &path) {
+    const std::string n = basename(path);
+    if (n.find("logic") != std::string::npos) return 100;
+    if (n.find("il2cpp") != std::string::npos) return 95;
+    if (n.find("csharp") != std::string::npos) return 90;
+    if (n.find("GameAssembly") != std::string::npos) return 85;
+    if (n.find("unity") != std::string::npos) return 60;
+    if (n.find("libmain") != std::string::npos) return 55;
+    if (n.find("libgame") != std::string::npos) return 50;
+    if (n.find("native") != std::string::npos) return 40;
+    if (path.find("/data/app/") != std::string::npos || path.find("/data/data/") != std::string::npos ||
+        path.find("/data/user/") != std::string::npos)
+        return 20;
+    return 10;
+}
+
+static bool mapping_is_elf(pid_t pid, uintptr_t addr) {
+    unsigned char mag[4] = {};
+    return mem_read(pid, addr, mag, sizeof(mag)) && mag[0] == 0x7f && mag[1] == 'E' && mag[2] == 'L' &&
+           mag[3] == 'F';
+}
+
 static void collect_modules(pid_t pid, std::vector<SoModule> &out) {
     out.clear();
     std::vector<MapsReg> maps;
@@ -36,32 +58,25 @@ static void collect_modules(pid_t pid, std::vector<SoModule> &out) {
 
     for (const auto &m : maps) {
         if (m.path.empty() || m.path[0] != '/') continue;
-        if (m.path.find(".so") == std::string::npos) continue;
         if (skip_lib(m.path)) continue;
-        if (m.fileOff != 0 || m.perms[0] != 'r') continue;
+        if (m.perms[0] != 'r') continue;
+        if (!mapping_is_elf(pid, m.start)) continue;
+        out.push_back({m.path, m.start, m.end});
+    }
 
-        bool merged = false;
-        for (auto &mod : out) {
-            if (mod.path == m.path) {
-                mod.end = std::max(mod.end, m.end);
-                merged = true;
-                break;
-            }
+    for (auto &mod : out) {
+        for (const auto &m : maps) {
+            if (m.path != mod.path || m.start < mod.base) continue;
+            if (m.start > mod.base + 0x20000000ULL) continue;
+            mod.end = std::max(mod.end, m.end);
         }
-        if (!merged)
-            out.push_back({m.path, m.start, m.end});
     }
 
     std::sort(out.begin(), out.end(), [](const SoModule &a, const SoModule &b) {
-        auto score = [](const std::string &n) {
-            if (n.find("logic") != std::string::npos) return 100;
-            if (n.find("il2cpp") != std::string::npos) return 95;
-            if (n.find("csharp") != std::string::npos) return 90;
-            if (n.find("GameAssembly") != std::string::npos) return 85;
-            if (n.find("unity") != std::string::npos) return 50;
-            return 10;
-        };
-        return score(basename(a.path)) > score(basename(b.path));
+        const int sa = lib_score(a.path);
+        const int sb = lib_score(b.path);
+        if (sa != sb) return sa > sb;
+        return a.base < b.base;
     });
 }
 
@@ -146,15 +161,7 @@ static bool domain_from_getter(pid_t pid, uintptr_t func, uintptr_t &domainOut) 
 }
 
 static bool module_like_il2cpp(const SoModule &m) {
-    const std::string n = basename(m.path);
-    if (n.find("logic") != std::string::npos) return true;
-    if (n.find("il2cpp") != std::string::npos) return true;
-    if (n.find("csharp") != std::string::npos) return true;
-    if (n.find("GameAssembly") != std::string::npos) return true;
-    const bool inApp = m.path.find("/data/app/") != std::string::npos ||
-                       m.path.find("/data/data/") != std::string::npos ||
-                       m.path.find("/data/user/") != std::string::npos;
-    return inApp;
+    return lib_score(m.path) >= 20;
 }
 
 static bool try_module(pid_t pid, const SoModule &m, RemoteIl2CppInfo &out, int &apiHits) {
