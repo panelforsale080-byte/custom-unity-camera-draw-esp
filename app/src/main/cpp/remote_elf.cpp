@@ -291,7 +291,7 @@ static bool dynsym_lookup(pid_t pid, uintptr_t base, const Elf64_Ehdr &eh, uintp
             if (!s.st_value || s.st_name >= str.size()) continue;
             const char *nm = str.data() + s.st_name;
             const size_t avail = str.size() - s.st_name;
-            if (std::strnlen(nm, avail) == avail) continue;
+            if (strnlen(nm, avail) == avail) continue;
             if (std::strcmp(nm, sym) != 0) continue;
             addr = bias + (uintptr_t)s.st_value;
             return true;
