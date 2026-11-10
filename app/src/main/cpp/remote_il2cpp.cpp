@@ -4,6 +4,7 @@
 #include "remote_elf.hpp"
 #include "ui_log.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -14,6 +15,7 @@ struct SoModule {
     std::string path;
     uintptr_t base = 0;
     uintptr_t end = 0;
+    uintptr_t fileOff = 0;
 };
 
 static std::string basename(const std::string &p) {
@@ -61,7 +63,18 @@ static void collect_modules(pid_t pid, std::vector<SoModule> &out) {
         if (skip_lib(m.path)) continue;
         if (m.perms[0] != 'r') continue;
         if (!mapping_is_elf(pid, m.start)) continue;
-        out.push_back({m.path, m.start, m.end});
+        out.push_back({m.path, m.start, m.end, m.fileOff});
+    }
+
+    for (const auto &m : maps) {
+        if (m.path.empty() || m.path[0] != '/') continue;
+        if (skip_lib(m.path)) continue;
+        if (m.perms[0] != 'r' || m.fileOff != 0) continue;
+        if (m.path.find(".so") == std::string::npos) continue;
+        bool exists = false;
+        for (const auto &mod : out)
+            if (mod.base == m.start) exists = true;
+        if (!exists) out.push_back({m.path, m.start, m.end, m.fileOff});
     }
 
     for (auto &mod : out) {
@@ -84,7 +97,8 @@ static bool resolve_sym(pid_t pid, const SoModule &m, const char *sym, uintptr_t
     addr = 0;
     if (elf_remote_sym(pid, m.base, sym, addr)) return true;
     ElfRemote er{};
-    if (!elf_remote_bias(pid, m.base, er)) return false;
+    if (!elf_remote_bias(pid, m.base, er)) er.load_bias = m.base;
+    if (m.fileOff && elf_file_sym_at(m.path.c_str(), m.fileOff, er.load_bias, sym, addr)) return true;
     return elf_file_sym(m.path.c_str(), er.load_bias, sym, addr);
 }
 
@@ -351,10 +365,16 @@ bool remote_detect_il2cpp(pid_t pid, RemoteIl2CppInfo &out) {
         }
     }
 
-    std::snprintf(out.note, sizeof(out.note),
-                  "scanned %zu modules (%d tried), no il2cpp_domain_get in dynsym/symtab",
-                  mods.size(), tried);
-    ui_log("[il2cpp] FAIL %s", out.note);
+    char seen[160] = {};
+    size_t used = 0;
+    for (size_t i = 0; i < mods.size() && i < 4; ++i) {
+        const std::string n = basename(mods[i].path);
+        const int wr = std::snprintf(seen + used, sizeof(seen) - used, "%s%s", used ? " " : "", n.c_str());
+        if (wr <= 0 || used + (size_t)wr >= sizeof(seen)) break;
+        used += (size_t)wr;
+    }
+    std::snprintf(out.note, sizeof(out.note), "no il2cpp_domain_get in %s", seen[0] ? seen : "this process");
+    ui_log("[il2cpp] FAIL tried=%d %s", tried, out.note);
     if (!mods.empty())
         ui_log("[il2cpp] top map: %s @ 0x%llx", mods[0].path.c_str(),
                (unsigned long long)mods[0].base);

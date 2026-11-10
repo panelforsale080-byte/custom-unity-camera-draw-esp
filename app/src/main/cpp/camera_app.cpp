@@ -386,7 +386,15 @@ void tick() {
         g_run.store(false);
         return;
     }
-    if (!g_resolved && !resolve_locked(g_pid)) return;
+    if (!g_resolved) {
+        static auto nextTry = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now < nextTry) return;
+        if (!resolve_locked(g_pid)) {
+            nextTry = now + std::chrono::seconds(1);
+            return;
+        }
+    }
     std::vector<Hero> heroes;
     uintptr_t local = 0;
     read_heroes(heroes, local);

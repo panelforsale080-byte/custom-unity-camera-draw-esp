@@ -11,5 +11,7 @@ bool elf_file_map_bias(const char *path, uintptr_t map_base, uintptr_t &load_bia
 bool elf_remote_bias(pid_t pid, uintptr_t map_base, ElfRemote &out);
 bool elf_remote_sym(pid_t pid, uintptr_t map_base, const char *name, uintptr_t &addr_out);
 bool elf_file_sym(const char *path, uintptr_t load_bias, const char *name, uintptr_t &addr_out);
+bool elf_file_sym_at(const char *path, uintptr_t elf_file_off, uintptr_t load_bias, const char *name,
+                     uintptr_t &addr_out);
 bool elf_file_sym_contains(const char *path, uintptr_t load_bias, const char *needle,
                            uintptr_t &addr_out, char *matched, size_t matchedCap);
